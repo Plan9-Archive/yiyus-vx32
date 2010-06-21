@@ -24,9 +24,12 @@
 #include	"error.h"
 #include	"arg.h"
 #include	"tos.h"
-#include	"ve.h"
 
 #include "fs.h"
+
+#include "netif.h"
+#include "etherif.h"
+#include "vether.h"
 
 #define Image IMAGE
 #include	"draw.h"
@@ -54,11 +57,10 @@ static char*	inifile;
 static char	inibuf[BOOTARGSLEN];
 static char	*iniline[MAXCONF];
 static int	bootboot;	/* run /boot/boot instead of bootscript */
+static int	nofork;	/* do not fork at init */
 static int	initrc;	/* run rc instead of init */
 static int	nogui;	/* do not start the gui */
 static int	usetty;	/* use tty for input/output */
-static int	nve;		/* number of virtual ethernet devices */
-static Vether	vedev[MaxVEther-1];
 static char*	username;
 static Mach mach0;
 
@@ -83,7 +85,7 @@ void
 usage(void)
 {
 	// TODO(yy): add debug and other options by ron
-	fprint(2, "usage: 9vx [-p file.ini] [-bgit] [-n [tap] [netdev]] [-m macaddr] [-r root] [-u user]\n");
+	fprint(2, "usage: 9vx [-p file.ini] [-bfgit] [-m memsize] [-n [tap] [netdev]] [-a macaddr] [-r root] [-u user]\n");
 	exit(1);
 }
 
@@ -95,16 +97,20 @@ nop(void)
 int
 main(int argc, char **argv)
 {
-	int nofork;
+	int memsize;
+	int vetap;
+	char *vedev;
 	char buf[1024];
 	
 	/* Minimal set up to make print work. */
 	setmach(&mach0);
 	coherence = nop;
 	quotefmtinstall();
-	
+
+	memsize = 0;	
 	nogui = 0;
 	nofork = 0;
+	nve = 0;
 	usetty = 0;
 	nve = 0;
 	localroot = nil;
@@ -121,9 +127,6 @@ main(int argc, char **argv)
 		break;
 	case 'K':
 		tracekdev++;
-		break;
-	case 'F':
-		nofork = 1;
 		break;
 	case 'M':
 		tracemmu++;
@@ -142,8 +145,14 @@ main(int argc, char **argv)
 		break;
 	
 	/* real options */
+	case 'a':
+		setmac(EARGF(usage()));
+		break;
 	case 'b':
 		bootboot = 1;
+		break;
+	case 'f':
+		nofork = 1;
 		break;
 	case 'g':
 		nogui = 1;
@@ -155,27 +164,22 @@ main(int argc, char **argv)
 	case 'p':
 		inifile = EARGF(usage());
 		break;
-	case 'n':
-		if(nve == MaxVEther)
-			panic("too many network devices");
-		vedev[nve].dev = ARGF();
-		if(strcmp(vedev[nve].dev, "tap") != 0){
-			vedev[nve].type = VEpcap;
-			nve++;
-			break;
-		}
-		vedev[nve].type = VEtap;
-		vedev[nve].dev = ARGF();
-		if(vedev[nve].dev != nil && vedev[nve].dev[0] == '-'){
-			vedev[nve].dev = nil;
-			argc++;
-			*argv--;
-		}
-		nve++;
-		break;
 	case 'm':
-		if(nve > 0)
-			vedev[nve-1].mac = EARGF(usage());
+		memsize = atoi(EARGF(usage()));
+		break;
+	case 'n':
+		vetap = 0;
+		vedev = ARGF();
+		if(vedev != nil && strcmp(vedev, "tap") == 0){
+			vetap = 1;
+			vedev = ARGF();
+		}
+		if(vedev != nil && vedev[0] == '-'){
+			vedev = nil;
+			argc++;
+			argv--;
+		}
+		addve(vedev, vetap);
 		break;
 	case 'r':
 		localroot = EARGF(usage());
@@ -214,6 +218,8 @@ main(int argc, char **argv)
 	if(eve == nil)
 		panic("strdup eve");
 
+	mmusize(memsize);
+
 	mach0init();
 	mmuinit();
 	confinit();
@@ -243,19 +249,18 @@ main(int argc, char **argv)
 	print("9vx ");
 	if(inifile)
 		print("-p %s ", inifile);
-	if(bootboot | nogui | initrc | usetty)
-		print("-%s%s%s%s ", bootboot ? "b" : "", nogui ? "g" : "",
-			initrc ? "i " : "", usetty ? "t " : "");
-/*
-	if(vether)
-		print("-n ");
-	if(nettap)
-		print("tap ");
-	if(netdev)
-		print("%s ", netdev);
-	if(macaddr)
-		print("-m %s ", macaddr);
-*/
+	if(bootboot | nofork | nogui | initrc | usetty)
+		print("-%s%s%s%s%s ", bootboot ? "b" : "", nofork ? "f " : "",
+			nogui ? "g" : "", initrc ? "i " : "", usetty ? "t " : "");
+	if(memsize != 0)
+		print("-m %d ", memsize);
+	for(int i=0; i<nve; i++){
+		print("-n %s", ve[i].tap ? "tap ": "");
+		if(ve[i].dev != nil)
+			print("%s ", ve[i].dev);
+		if(ve[i].mac != nil)
+			print("-a %s ", ve[i].mac);
+	}
 	print("-r %s -u %s\n", localroot, username);
 
 	if(nve == 0)
@@ -264,8 +269,8 @@ main(int argc, char **argv)
 	printinit();
 	procinit0();
 	initseg();
-	if(nve != 0)
-		links(vedev);
+	if(nve > 0)
+		links();
 
 	chandevreset();
 	if(!singlethread){
@@ -301,7 +306,9 @@ readini(char *fn)
 	int blankline, incomment, inspace, n, fd;
 	char *cp, *p, *q;
 
-	if((fd = open(fn, OREAD)) < 0)
+	if(strcmp(fn, "-") == 0)
+		fd = stdin;
+	else if((fd = open(fn, OREAD)) < 0)
 		return -1;
 
 	cp = inibuf;
@@ -388,32 +395,33 @@ inifields(void (*fp)(char*, char*))
 void
 iniopt(char *name, char *value)
 {
+	char *vedev;
+	int vetap;
+
 	if(*name == '*')
 		name++;
 	if(strcmp(name, "bootboot") == 0)
 		bootboot = 1;
 	else if(strcmp(name, "initrc") == 0)
 		initrc = 1;
+	else if(strcmp(name, "nofork") == 0)
+		nofork = 1;
 	else if(strcmp(name, "localroot") == 0 && !localroot)
 		localroot = value;
 	else if(strcmp(name, "user") == 0 && !username)
 		username = value;
 	else if(strcmp(name, "usetty") == 0)
 		usetty = 1;
-/*
-	else if(strcmp(name, "netdev") == 0 && !netdev){
-		vether = 1;
+	else if(strcmp(name, "macaddr") == 0)
+		setmac(value);
+	else if(strcmp(name, "netdev") == 0){
 		if(strncmp(value, "tap", 3) == 0) {
-			nettap = 1;
+			vetap = 1;
 			value += 4;
 		}
-		netdev = value;
+		vedev = value;
+		addve(vedev, vetap);
 	}
-	else if(strcmp(name, "macaddr") == 0 && !macaddr){
-		vether = 1;
-		macaddr = value;
-	}
-*/
 	else if(strcmp(name, "nogui") == 0){
 		nogui = 1;
 		usetty = 1;
