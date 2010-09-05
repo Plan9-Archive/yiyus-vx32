@@ -25,21 +25,19 @@
 #include	"arg.h"
 #include	"tos.h"
 
-#include "fs.h"
+#include	"fs.h"
 
-#include "netif.h"
-#include "etherif.h"
-#include "vether.h"
+#include	"conf.h"
+
+#include	"netif.h"
+#include	"etherif.h"
+#include	"vether.h"
 
 #define Image IMAGE
 #include	"draw.h"
 #include	"memdraw.h"
 #include	"cursor.h"
 #include	"screen.h"
-
-#define	BOOTLINELEN	64
-#define	BOOTARGSLEN	(3584-0x200-BOOTLINELEN)
-#define	MAXCONF		100
 
 extern Dev ipdevtab;
 extern Dev pipdevtab;
@@ -49,23 +47,14 @@ extern Dev audiodevtab;
 
 int	doabort = 1;	// for now
 int	abortonfault;
+int	nocpuload;
 char*	argv0;
 char*	conffile = "9vx";
+char*	defaultroot = "local!#Z/usr/local/9vx";
 Conf	conf;
 
-static char*	inifile;
-static char	inibuf[BOOTARGSLEN];
-static char	*iniline[MAXCONF];
-static int	bootboot;	/* run /boot/boot instead of bootscript */
-static int	memsize;	/* memory size */
-static int	nofork;	/* do not fork at init */
-static int	initrc;	/* run rc instead of init */
-static int	nogui;	/* do not start the gui */
-static int	usetty;	/* use tty for input/output */
-static char*	username;
 static Mach mach0;
 
-extern char*	localroot;
 extern int	tracemmu;
 extern int tracekdev;
 extern int nuspace;
@@ -74,19 +63,14 @@ static int singlethread;
 static void	bootinit(void);
 static void	siginit(void);
 
-static int	readini(char *fn);
-static void	inifields(void (*fp)(char*, char*));
-static void	iniopt(char *name, char *value);
-static void	inienv(char *name, char *value);
-
 static char*	getuser(void);
-static char*	findroot(void);
+static char*	nobootprompt(char*);
 
 void
 usage(void)
 {
 	// TODO(yy): add debug and other options by ron
-	fprint(2, "usage: 9vx [-p file.ini] [-bfgit] [-m memsize] [-n [tap] [netdev]] [-a macaddr] [-r root] [-u user]\n");
+	fprint(2, "usage: 9vx [-p file.ini] [-fgit] [-l cpulimit] [-m memsize] [-n [tap] netdev] [-a macaddr] [-r root] [-u user] [bootargs]\n");
 	exit(1);
 }
 
@@ -100,15 +84,17 @@ main(int argc, char **argv)
 {
 	int vetap;
 	char *vedev;
-	char buf[1024];
-	
+	char *inifile;
+
 	/* Minimal set up to make print work. */
 	setmach(&mach0);
 	coherence = nop;
 	quotefmtinstall();
 
-	localroot = nil;
-	memsize = 0;	
+	cpulimit = 0;
+	inifile = nil;
+	memset(iniline, 0, MAXCONF);
+	memmb = 0;
 	nogui = 0;
 	nofork = 0;
 	nve = 0;
@@ -126,6 +112,9 @@ main(int argc, char **argv)
 		break;
 	case 'K':
 		tracekdev++;
+		break;
+	case 'L':
+		nocpuload++;
 		break;
 	case 'M':
 		tracemmu++;
@@ -147,8 +136,8 @@ main(int argc, char **argv)
 	case 'a':
 		setmac(EARGF(usage()));
 		break;
-	case 'b':
-		bootboot = 1;
+	case 'c':
+		cpuserver = 1;
 		break;
 	case 'f':
 		nofork = 1;
@@ -160,8 +149,11 @@ main(int argc, char **argv)
 	case 'i':
 		initrc = 1;
 		break;
+	case 'l':
+		cpulimit = atoi(EARGF(usage()));
+		break;
 	case 'm':
-		memsize = atoi(EARGF(usage()));
+		memmb = atoi(EARGF(usage()));
 		break;
 	case 'n':
 		vetap = 0;
@@ -170,11 +162,8 @@ main(int argc, char **argv)
 			vetap = 1;
 			vedev = ARGF();
 		}
-		if(vedev != nil && vedev[0] == '-'){
-			vedev = nil;
-			argc++;
-			argv--;
-		}
+		if(vedev == nil)
+			usage();
 		addve(vedev, vetap);
 		break;
 	case 'p':
@@ -192,33 +181,27 @@ main(int argc, char **argv)
 	default:
 		usage();
 	}ARGEND
-	
-	if(argc != 0)
-		usage();
-	
-	if(inifile){
-		if(readini(inifile) != 0)
-			panic("error reading config file %s", inifile);
-		conffile=inifile;
-		inifields(&iniopt);
-	}
 
-	if(!bootboot){
-		if(localroot == nil && (localroot = findroot()) == nil)
-			panic("cannot find plan 9 root; use -r");
-		snprint(buf, sizeof buf, "%s/386/bin/rc", localroot);
-		if(access(buf, 0) < 0)
-			panic("%s does not exist", buf);
-	}
+	if(inifile != nil && readini(inifile) != 0)
+		panic("error reading config file %s", inifile);
 
+	bootargc = argc;
+	bootargv = argv;
+	/*
+	 * bootargs have preference over -r
+	 */
+	if(bootargc > 0)
+		localroot = nil;
+
+	inifields(&iniopt);
+	
 	if(username == nil && (username = getuser()) == nil)
 		username = "tor";
 	eve = strdup(username);
 	if(eve == nil)
 		panic("strdup eve");
 
-	mmusize(memsize);
-
+	mmusize(memmb);
 	mach0init();
 	mmuinit();
 	confinit();
@@ -242,25 +225,7 @@ main(int argc, char **argv)
 	 */
 	siginit();
 
-	/*
-	 * Debugging: tell user what options we guessed.
-	 */
-	print("9vx ");
-	if(inifile)
-		print("-p %s ", inifile);
-	if(bootboot | nofork | nogui | initrc | usetty)
-		print("-%s%s%s%s%s ", bootboot ? "b" : "", nofork ? "f " : "",
-			nogui ? "g" : "", initrc ? "i " : "", usetty ? "t " : "");
-	if(memsize != 0)
-		print("-m %d ", memsize);
-	for(int i=0; i<nve; i++){
-		print("-n %s", ve[i].tap ? "tap ": "");
-		if(ve[i].dev != nil)
-			print("%s ", ve[i].dev);
-		if(ve[i].mac != nil)
-			print("-a %s ", ve[i].mac);
-	}
-	print("-r %s -u %s\n", localroot, username);
+	printconfig(argv0);
 
 	if(nve == 0)
 		ipdevtab = pipdevtab;
@@ -278,6 +243,10 @@ main(int argc, char **argv)
 		makekprocdev(&fsdevtab);
 		makekprocdev(&drawdevtab);
 		makekprocdev(&audiodevtab);
+		if(nocpuload == 0)
+			kproc("pload", &ploadproc, nil);
+		if(cpulimit > 0 && cpulimit < 100)
+			kproc("plimit", &plimitproc, &cpulimit);
 	}
 	bootinit();
 	pageinit();
@@ -296,182 +265,16 @@ main(int argc, char **argv)
 	return 0;  // Not reached
 }
 
-/*
- *  read configuration file
- */
-int
-readini(char *fn)
-{
-	int blankline, incomment, inspace, n, fd;
-	char *cp, *p, *q;
+char*
+nobootprompt(char *root) {
+	char cwd[1024];
 
-	if(strcmp(fn, "-") == 0)
-		fd = fileno(stdin);
-	else if((fd = open(fn, OREAD)) < 0)
-		return -1;
-
-	cp = inibuf;
-	*cp = 0;
-	n = read(fd, cp, BOOTARGSLEN-1);
-	close(fd);
-	if(n <= 0)
-		return -1;
-
-	cp[n] = 0;
-
-	/*
-	 * Strip out '\r', change '\t' -> ' '.
-	 * Change runs of spaces into single spaces.
-	 * Strip out trailing spaces, blank lines.
-	 *
-	 * We do this before we make the copy so that if we 
-	 * need to change the copy, it is already fairly clean.
-	 * The main need is in the case when plan9.ini has been
-	 * padded with lots of trailing spaces, as is the case 
-	 * for those created during a distribution install.
-	 */
-	p = cp;
-	blankline = 1;
-	incomment = inspace = 0;
-	for(q = cp; *q; q++){
-		if(*q == '\r')
-			continue;
-		if(*q == '\t')
-			*q = ' ';
-		if(*q == ' '){
-			inspace = 1;
-			continue;
-		}
-		if(*q == '\n'){
-			if(!blankline){
-				if(!incomment)
-					*p++ = '\n';
-				blankline = 1;
-			}
-			incomment = inspace = 0;
-			continue;
-		}
-		if(inspace){
-			if(!blankline && !incomment)
-				*p++ = ' ';
-			inspace = 0;
-		}
-		if(blankline && *q == '#')
-			incomment = 1;
-		blankline = 0;
-		if(!incomment)
-			*p++ = *q;	
+	if(root[0] != '/'){
+		if(getcwd(cwd, sizeof cwd) == nil)
+			panic("getcwd: %r");
+		root = cleanname(smprint("%s/%s", cwd, root));
 	}
-	if(p > cp && p[-1] != '\n')
-		*p++ = '\n';
-	*p++ = 0;
-
-	getfields(cp, iniline, MAXCONF, 0, "\n");
-
-	return 0;
-}
-
-void
-inifields(void (*fp)(char*, char*))
-{
-	int i;
-	char *cp;
-
-	for(i = 0; i < MAXCONF; i++){
-		if(!iniline[i])
-			break;
-		cp = strchr(iniline[i], '=');
-		if(cp == 0)
-			continue;
-		*cp++ = 0;
-		if(cp - iniline[i] >= NAMELEN+1)
-			*(iniline[i]+NAMELEN-1) = 0;
-		(fp)(iniline[i], cp);
-		*(cp-1) = '=';
-	}
-}
-
-void
-iniopt(char *name, char *value)
-{
-	char *cp, *vedev;
-	int vetap;
-
-	if(*name == '*')
-		name++;
-	if(strcmp(name, "bootboot") == 0)
-		bootboot = 1;
-	else if(strcmp(name, "initrc") == 0)
-		initrc = 1;
-	else if(strcmp(name, "nofork") == 0)
-		nofork = 1;
-	else if(strcmp(name, "memsize") == 0)
-		memsize = atoi(value);
-	else if(strcmp(name, "localroot") == 0 && !localroot)
-		localroot = value;
-	else if(strcmp(name, "user") == 0 && !username)
-		username = value;
-	else if(strcmp(name, "usetty") == 0)
-		usetty = 1;
-	else if(strcmp(name, "macaddr") == 0)
-		setmac(value);
-	else if(strcmp(name, "netdev") == 0){
-		if(strncmp(value, "tap", 3) == 0) {
-			vetap = 1;
-			value += 4;
-		}
-		vedev = value;
-		cp = vedev;
-		if((value = strchr(vedev, ' ')) != 0){
-			cp = strchr(value+1, '=');
-			*value=0;
-			*cp=0;
-		}
-		addve(*vedev == 0 ? nil : vedev, vetap);
-		if(cp != vedev){
-			iniopt(value+1, cp+1);
-			*value=' ';
-			*cp='=';
-		}
-	}
-	else if(strcmp(name, "nogui") == 0){
-		nogui = 1;
-		usetty = 1;
-	}
-}
-
-void
-inienv(char *name, char *value)
-{
-	if(*name != '*')
-		ksetenv(name, value, 0);
-}
-
-/*
- * Search for Plan 9 /386/bin/rc to find root.
- */
-static char*
-findroot(void)
-{
-	static char cwd[1024];
-	int i;
-	char buf[1024];
-	char *dir[] = {
-		cwd,
-		"/usr/local/9vx"
-	};
-	
-	if(getcwd(cwd, sizeof cwd) == nil){
-		oserrstr();
-		panic("getcwd: %r");
-	}
-
-	for(i=0; i<nelem(dir); i++){
-		snprint(buf, sizeof buf, "%s/386/bin/rc", dir[i]);
-		if(access(buf, 0) >= 0)
-			return dir[i];
-	}
-	return nil;
+	return smprint("local!#Z%s", root);
 }
 
 static char*
@@ -506,22 +309,6 @@ confinit(void)
 	conf.ialloc = 1<<20;
 }
 
-/*
- * Simple boot script.  Init0 takes care of setting up the
- * environment variables and name space bindings that
- * are needed to run rc and /386/init. 
- * Can't use #!/386/init -t directly, because init will treat
- * the extra argument /boot/boot as a command to run,
- * which will cause a loop.
- */
-static char *bootscript =
-	"#!/386/bin/rc\n"
-	"exec /386/init -t\n";
-
-static char *rcscript =
-	"#!/386/bin/rc\n"
-	"/386/bin/rc -i\n";
-
 static void
 bootinit(void)
 {
@@ -530,7 +317,14 @@ bootinit(void)
 	 * to ask for keys, so we have to embed a factotum binary,
 	 * even if we don't execute it to provide a file system.
 	 * Also, maybe /boot/boot needs it.
+	 *
+	 * factotum, fossil and venti are the normal Plan9 binary.
+	 * bootcode.9 is the file bootpcf.out obtained applyng
+	 * the patch in a/bootboot.ed and compiling with:
+	 *	mk 'CONF=pcf' bootpcf.out
 	 */
+	extern uchar bootcode[];
+	extern long bootlen;
 	extern uchar factotumcode[];
 	extern long factotumlen;
 	extern uchar fossilcode[];
@@ -538,14 +332,7 @@ bootinit(void)
 	extern uchar venticode[];
 	extern long ventilen;
 
-	if(bootboot){
-		extern uchar bootcode[];
-		extern long bootlen;
-		addbootfile("boot", bootcode, bootlen);
-	}else if(initrc)
-		addbootfile("boot", (uchar*)rcscript, strlen(rcscript));
-	else
-		addbootfile("boot", (uchar*)bootscript, strlen(bootscript));
+	addbootfile("boot", bootcode, bootlen);
 	addbootfile("factotum", factotumcode, factotumlen);
 	addbootfile("fossil", fossilcode, fossillen);
 	addbootfile("venti", venticode, ventilen);
@@ -642,7 +429,10 @@ bootargs(void *base)
 
 	ac = 0;
 	av[ac++] = pusharg("9vx");
-	/* TODO: could use command line argc, argv here if it was useful */
+	for(i = 0; i < bootargc && ac < 32; i++)
+		av[ac++] = pusharg(bootargv[i]);
+	if(i == 0)
+		av[ac++] = pusharg(defaultroot);
 
 	/* 4 byte word align stack */
 	sp = (uchar*)((uintptr)sp & ~3);
@@ -688,8 +478,6 @@ static void
 init0(void)
 {
 	char buf[2*KNAMELEN];
-	Chan *c, *srvc;
-	char *root;
 
 	up->nerrlab = 0;
 	if(waserror())
@@ -720,21 +508,11 @@ init0(void)
 	ksetenv("user", username, 0);
 	ksetenv("sysname", "vx32", 0);
 	inifields(&inienv);
-
-	/* if we're not running /boot/boot, mount / and create /srv/boot */
-	if(!bootboot){
-		kbind("#Zplan9/", "/", MAFTER);
-		kbind("#p", "/proc", MREPL);
-
-		/* create working /srv/boot for backward compatibility */
-		c = namec("#~/mntloop", Aopen, ORDWR, 0);
-		root = "#Zplan9/";
-		devtab[c->type]->write(c, root, strlen(root), 0);
-		srvc = namec("#s/boot", Acreate, OWRITE, 0666);
-		ksrvadd(srvc, c);
-		cclose(srvc);
-		cclose(c);
-	}
+	if(initrc != 0)
+		inienv("init", "/386/bin/rc -i");
+	if(localroot)
+		inienv("nobootprompt", nobootprompt(localroot));
+	inienv("cputype", "386");
 
 	poperror();
 

@@ -158,9 +158,35 @@ runproc(void)
 			m->machno, p->pid, p->text, kprocq.n, nrunproc);
 	unlock(&kprocq.lk);
 	punlock(&run);
+	/*
+	 * To avoid the "double sleep" bug
+	 * Full history begins at:
+	 * http://9fans.net/archive/2010/06/71
+	 */
 	while (p->mach)
 		sched_yield();
 	return p;
+}
+
+/*
+ * Limit CPU usage going to sleep while holding the run lock
+ */
+void
+plimitproc(void *v)
+{
+	int lim;
+	uint sleeping, working;
+
+	lim = *((int*)v);
+	sleeping = 100000 * (100 - lim) / 100;
+	working = 100000 * lim / 100;
+
+	for(;;){
+		usleep(working);
+		plock(&run);
+		usleep(sleeping);
+		punlock(&run);
+	}
 }
 
 /*
