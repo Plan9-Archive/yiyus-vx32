@@ -15,6 +15,9 @@
 [
 .I -u user
 ]
+[
+.I bootargs
+]
 .PP
 .B 9vx-tap
 [
@@ -28,6 +31,9 @@
 ]
 [
 .I -u user
+]
+[
+.I bootargs
 ]
 .SH DESCRIPTION
 Plan 9 VX (or
@@ -43,22 +49,28 @@ and removes the tap device when finished.
 .PP
 Options can be passed to
 .I 9vx
-as command line arguments or in a configuration file with the
+as command line arguments or in a configuration file specified with the
 .I -p
-option (see below). If no
-.I root
-argument is present, the current directory or
-.I /usr/local/9vx
-is used.
-Alternatively, a file system can be specified in the 9vx.ini file.
+option (see below). The host file server will be visible from inside as
+.I #Z.
+One or more
+.I bootargs
+arguments will be passed to boot/boot as explained in boot(8), with the addition that
+the local method also supports local directories. The
+.I -r
+option sets
+.I nobootprompt=local!#Z/root
+to boot from a local directory containing a Plan 9 tree.
 If an
 .I user
 is not specified, the current user in the host operating system will be used.
 Other options are:
 .nr xx \w'\fL-m\f2name\ \ '
 .TP \n(xxu
-.BI -b
-Run /boot/boot instead of bootscript
+.BI -c
+Start as a cpu(1) server (sets
+.I service=cpu
+)
 .TP
 .BI -f
 Do not fork at init
@@ -67,26 +79,29 @@ Do not fork at init
 Do not start the gui
 .TP
 .BI -i
-Run rc instead of init
+Run rc(1) instead of init (sets
+.I init=#Z/386/bin/rc
+)
 .TP
 .BI -t
 Use tty for input/output
 .TP
+.BI -l " cpulimit"
+Maximum cpu usage (in percentage)
+.TP
 .BI -m " memsize"
 Memory size
 .TP
-.BI -n " [ tap ] [ device ]"
+.BI -n " [ tap ] device"
 Create virtual ethernet devices. The
 .I tap
 option tells that
 .I device
 is a tap device. Else, the virtual device will use pcap(3) to intercept packets going to
 .I device,
-and will therefore need root privileges. If a host
+and will therefore need root privileges. If the host
 .I device
-is not specified, pcap will use the first one available, and tap will use the
-.I tap0
-device. More than one virtual ethernet device can be used. In absence of virtual devices, the network stack of the host system will be used.
+is not valid, pcap will use the first one available. More than one virtual ethernet device can be used. In absence of virtual devices, the network stack of the host system will be used.
 .TP
 .BI -a " macaddress"
 Use the hardware address
@@ -95,34 +110,42 @@ for the last given virtual network device.
 .SS 9vx.ini configuration files
 Configuration parameters can also be given to
 .I 9vx
-in the configuration file specified with the
+in a configuration file specified with the
 .I -p
 command line option.
-The file name
+A file name
 .L -
 means the standard input.
-The file
+A
 .I 9vx.ini
-has to contain a list of
+file contains a list of
 .I parameter=value
-pairs in a similar fasion to plan9.ini(8). Available options are
-.I bootboot,
+pairs in a similar fasion to plan9.ini(8). Additional options are
 .I nofork,
 .I nogui,
 .I initrc,
 .I usetty,
+.I cpulimit,
 .I memsize,
 .I netdev,
 .I macaddr
-(that can also be part of a netdev line),
-.I localroot
+.I service
+(that can also be part of a netdev line)
 and
-.I user.
-Other options will be passed to the boot process as environment variables.
+.I localroot.
+.SS Running 9vx as a cpu server
+To run 9vx as a cpu server the
+.I service
+environment variable must be set to
+.I cpu
+, in the 9vx.ini file or with the -c flag. It is recommended to add a cpurc
+in the /cfg/vx32/ directory, see cpurc(8). An example is included in the 9vx distribution.
 .SH BUGS
 The menu system of plan9.ini(8) is not supported in
 .I 9vx.ini
 files.
+.P
+kfs file systems are not supported by the included boot/boot
 .P
 .I 9vx
 is not so stable as native Plan9 systems.
