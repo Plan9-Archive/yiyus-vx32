@@ -16,7 +16,9 @@
 #include "etherif.h"
 #include "vether.h"
 
+#if defined(__APPLE__)
 #include <sys/socket.h>
+#endif
 #include <net/if.h>
 #include <sys/ioctl.h>
 
@@ -68,22 +70,19 @@ opentap(char *dev)
 		return -1;
 	return fd;
 }
-#elif defined(__DARWIN_UNIX03)
+#elif defined(__APPLE__)
 static int
 opentap(char *dev)
 {
 	int fd;
-	struct stat s;
+	char *tap0 = "/dev/tap0";
 
-	iprint("tundev: %s\n", dev);
-	if((fd = open("/dev/tap0", O_RDWR)) < 0)
+	if(dev == nil)
+		dev = tap0;
+	if((fd = open(dev, O_RDWR)) < 0) {
+		iprint("tap: open failed with: %d\n", errno);
 		return -1;
-	/* 
-	 *  miserable hack to get the interface up, 
-	 *  feel free to add the ioctls if you're feeling energetic. 
-	 */
-	system("ifconfig tap0 0.0.0.0 up");
-
+	}
 	return fd;
 }
 #endif
@@ -171,9 +170,9 @@ tappnp(Ether* e)
 	Ctlr c;
 	static int cve = 0;
 
-	while(cve < nve && ve[cve].tap == 0)
+	while(cve < MaxEther && ve[cve].tap == 0)
 		cve++;
-	if(cve == nve)
+	if(cve == MaxEther || ve[cve].dev == nil)
 		return -1;
 
 	memset(&c, 0, sizeof c);
